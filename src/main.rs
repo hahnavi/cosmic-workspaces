@@ -3,6 +3,7 @@
 
 #![allow(clippy::single_match)]
 
+use cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1;
 use cctk::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1;
 use cctk::cosmic_protocols::workspace::v2::client::zcosmic_workspace_handle_v2;
 use cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
@@ -35,10 +36,11 @@ use cosmic_config::CosmicConfigEntry;
 use cosmic_config::cosmic_config_derive::CosmicConfigEntry;
 use cosmic_panel_config::{CosmicPanelConfig, CosmicPanelContainerConfigEntry, PanelAnchor};
 use i18n_embed::DesktopLanguageRequester;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, str};
 
 mod dbus;
@@ -54,6 +56,98 @@ mod widgets;
 use dnd::{DragSurface, DragToplevel, DragWorkspace, DropTarget};
 
 const SCROLL_RATE_LIMIT: Duration = Duration::from_millis(200);
+
+const ANIM_OPEN_DURATION: Duration = Duration::from_millis(300);
+const ANIM_CLOSE_DURATION: Duration = Duration::from_millis(250);
+const ANIM_STAGGER: Duration = Duration::from_millis(15);
+const ANIM_MAX_STAGGER: Duration = Duration::from_millis(105);
+const ANIM_TICK: Duration = Duration::from_millis(16);
+const CHROME_FADE_FRACTION: f32 = 0.5;
+const ANIM_SWITCH_DURATION: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy)]
+struct Anim {
+    start: Instant,
+    from: f32,
+    to: f32,
+}
+
+impl Anim {
+    fn duration(&self) -> Duration {
+        if self.to > self.from {
+            ANIM_OPEN_DURATION
+        } else {
+            ANIM_CLOSE_DURATION
+        }
+    }
+
+    fn t(&self, now: Instant) -> f32 {
+        if self.to == self.from {
+            return self.to;
+        }
+        let elapsed = now.saturating_duration_since(self.start);
+        (elapsed.as_secs_f32() / self.duration().as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        let t = cosmic::anim::smootherstep(self.t(now));
+        self.from + (self.to - self.from) * t
+    }
+
+    fn progress_with_delay(&self, now: Instant, delay: Duration) -> f32 {
+        if self.to == self.from {
+            return self.to;
+        }
+        let elapsed = now.saturating_duration_since(self.start);
+        if elapsed <= delay {
+            return self.from;
+        }
+        let t = ((elapsed - delay).as_secs_f32() / self.duration().as_secs_f32()).clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * cosmic::anim::smootherstep(t)
+    }
+
+    fn chrome_fade(&self, now: Instant) -> f32 {
+        self.from + (self.to - self.from) * (self.t(now) / CHROME_FADE_FRACTION).min(1.0)
+    }
+
+    fn done(&self, now: Instant, max_delay: Duration) -> bool {
+        now.saturating_duration_since(self.start) >= self.duration() + max_delay
+    }
+
+    fn anchored(&self, anchor: Option<Instant>) -> Anim {
+        Anim {
+            start: anchor.map_or(self.start, |anchor| anchor.max(self.start)),
+            ..*self
+        }
+    }
+}
+
+fn anim_stagger(index: usize, count: usize, reversed: bool) -> Duration {
+    if count <= 1 {
+        return Duration::ZERO;
+    }
+    let index = if reversed { count - 1 - index } else { index };
+    ANIM_STAGGER.mul_f64(index as f64).min(ANIM_MAX_STAGGER)
+}
+
+#[derive(Debug, Clone)]
+struct SwitchAnim {
+    start: Instant,
+    direction: i32,
+    from_workspace: ExtWorkspaceHandleV1,
+}
+
+impl SwitchAnim {
+    fn t(&self, now: Instant) -> f32 {
+        (now.saturating_duration_since(self.start).as_secs_f32()
+            / ANIM_SWITCH_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0)
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        cosmic::anim::smootherstep(self.t(now))
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, CosmicConfigEntry)]
 struct CosmicWorkspacesConfig {
@@ -95,6 +189,8 @@ enum Msg {
     CloseWorkspace(ExtWorkspaceHandleV1),
     ActivateToplevel(ExtForeignToplevelHandleV1),
     CloseToplevel(ExtForeignToplevelHandleV1),
+    MinimizeToplevel(ExtForeignToplevelHandleV1),
+    ToggleMaximizeToplevel(ExtForeignToplevelHandleV1),
     StartDrag(DragSurface),
     DndEnter(DropTarget, f64, f64, Vec<String>),
     DndLeave(DropTarget),
@@ -120,6 +216,7 @@ enum Msg {
     ActionOnTyping(String),
     Ignore,
     Rectangle(RectangleUpdate<RectId>),
+    Tick(Instant),
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +254,7 @@ struct Toplevel {
     img: Option<backend::CaptureImage>,
     icon: Option<PathBuf>,
     pub pending_move: Option<ExtWorkspaceHandleV1>,
+    activated_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -212,6 +310,9 @@ struct App {
     rectangle_tracker: Option<RectangleTracker<RectId>>,
     rects: HashMap<RectId, Rectangle>,
     sub_ctr: u128,
+    anim: Option<Anim>,
+    switch_anims: HashMap<wl_output::WlOutput, SwitchAnim>,
+    first_anim_frame: Cell<Option<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -262,10 +363,11 @@ impl App {
                 id,
                 keyboard_interactivity: KeyboardInteractivity::Exclusive,
                 namespace: "cosmic-workspace-overview".into(),
-                layer: Layer::Top,
+                layer: Layer::Bottom,
                 size: Some((None, None)),
                 output: IcedOutput::Output(output.clone()),
                 anchor: Anchor::all(),
+                exclusive_zone: -1,
                 ..Default::default()
             },
             None::<fn() -> cosmic::Element<'static, cosmic::Action<Msg>>>,
@@ -294,31 +396,89 @@ impl App {
     }
 
     fn show(&mut self) -> Task<cosmic::Action<Msg>> {
-        if !self.visible {
-            self.visible = true;
-            let outputs = self.outputs.clone();
-            let cmd = Task::batch(
-                outputs
-                    .into_iter()
-                    .map(|output| self.create_surface(output.handle))
-                    .collect::<Vec<_>>(),
-            );
-            self.update_capture_filter();
-
-            if let Some(interface) = self.dbus_interface.clone() {
-                tokio::spawn(async move {
-                    let _ = interface.shown().await;
-                });
+        if self.visible {
+            if let Some(anim) = self.anim {
+                let now = Instant::now();
+                let from = anim.progress(now);
+                if from < 1.0 {
+                    self.anim = Some(Anim {
+                        start: now,
+                        from,
+                        to: 1.0,
+                    });
+                    let active = self
+                        .workspaces
+                        .0
+                        .iter()
+                        .filter(|w| w.is_active())
+                        .map(|w| w.handle().id())
+                        .collect::<Vec<_>>();
+                    return Task::batch(
+                        active
+                            .into_iter()
+                            .filter_map(|workspace| self.update_active_workspace(workspace))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                self.anim = None;
             }
-
-            cmd
-        } else {
-            Task::none()
+            return Task::none();
         }
+        self.visible = true;
+        self.anim = Some(Anim {
+            start: Instant::now(),
+            from: 0.0,
+            to: 1.0,
+        });
+        self.first_anim_frame = Cell::new(None);
+        self.switch_anims.clear();
+        let outputs = self.outputs.clone();
+        let cmd = Task::batch(
+            outputs
+                .into_iter()
+                .map(|output| self.create_surface(output.handle))
+                .collect::<Vec<_>>(),
+        );
+        self.update_capture_filter();
+
+        if let Some(interface) = self.dbus_interface.clone() {
+            tokio::spawn(async move {
+                let _ = interface.shown().await;
+            });
+        }
+
+        cmd
     }
 
-    // Close all shell surfaces
+    // Animate the overview closed, then destroy all shell surfaces once it
+    // finishes (`Msg::Tick`).
     fn hide(&mut self) -> Task<cosmic::Action<Msg>> {
+        if !self.visible {
+            return Task::none();
+        }
+        self.switch_anims.clear();
+        if self.layer_surfaces.is_empty() {
+            return self.finish_hide();
+        }
+        let now = Instant::now();
+        let from = self.anim.map_or(1.0, |anim| anim.progress(now));
+        self.anim = Some(Anim {
+            start: now,
+            from,
+            to: 0.0,
+        });
+        Task::batch(
+            self.layer_surfaces
+                .keys()
+                .copied()
+                .map(|id| {
+                    cosmic::iced::platform_specific::shell::commands::blur::blur(id, None).discard()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn finish_hide(&mut self) -> Task<cosmic::Action<Msg>> {
         if let Some(interface) = self.dbus_interface.clone() {
             tokio::spawn(async move {
                 let _ = interface.hidden().await;
@@ -353,6 +513,8 @@ impl App {
         self.action_on_typing_activated = false;
 
         self.visible = false;
+        self.anim = None;
+        self.first_anim_frame = Cell::new(None);
         self.update_capture_filter();
         self.drag_surface = None;
         Task::batch(
@@ -361,6 +523,10 @@ impl App {
                 .copied()
                 .map(destroy_layer_surface),
         )
+    }
+
+    fn closing(&self) -> bool {
+        self.anim.is_some_and(|anim| anim.to == 0.0)
     }
 
     fn send_wayland_cmd(&self, cmd: backend::Cmd) {
@@ -381,6 +547,11 @@ impl App {
                 .filter(|x| x.is_active())
                 .map(|x| x.handle().clone())
                 .collect();
+            for anim in self.switch_anims.values() {
+                capture_filter
+                    .toplevels_on_workspaces
+                    .push(anim.from_workspace.clone());
+            }
         }
 
         // Drop `CaptureImage` for workspaces and toplevels not matching new
@@ -409,39 +580,37 @@ impl App {
         // TODO: If compositor supports overlap notify, also use that?
         // Or otherwise verify the panel is actually running.
         for config in self.panel_configs.values().flatten() {
-            if config.autohide_enabled() && !config.exclusive_zone {
-                let dimention_constraints = config.get_dimensions(
-                    Some((output.width as u32, output.height as u32)),
-                    None,
-                    Some(config.get_effective_anchor_gap()),
-                );
-                let size =
-                    config.size.get_applet_icon_size_with_padding(true) + u32::from(config.margin);
-                match config.anchor {
-                    PanelAnchor::Left => {
-                        let size = dimention_constraints.0.map_or(size, |constraints| {
-                            size.clamp(constraints.start, constraints.end)
-                        });
-                        regions.left += size as f32;
-                    }
-                    PanelAnchor::Right => {
-                        let size = dimention_constraints.0.map_or(size, |constraints| {
-                            size.clamp(constraints.start, constraints.end)
-                        });
-                        regions.right += size as f32;
-                    }
-                    PanelAnchor::Top => {
-                        let size = dimention_constraints.1.map_or(size, |constraints| {
-                            size.clamp(constraints.start, constraints.end)
-                        });
-                        regions.top += size as f32;
-                    }
-                    PanelAnchor::Bottom => {
-                        let size = dimention_constraints.1.map_or(size, |constraints| {
-                            size.clamp(constraints.start, constraints.end)
-                        });
-                        regions.bottom += size as f32;
-                    }
+            let dimention_constraints = config.get_dimensions(
+                Some((output.width as u32, output.height as u32)),
+                None,
+                Some(config.get_effective_anchor_gap()),
+            );
+            let size =
+                config.size.get_applet_icon_size_with_padding(true) + u32::from(config.margin);
+            match config.anchor {
+                PanelAnchor::Left => {
+                    let size = dimention_constraints.0.map_or(size, |constraints| {
+                        size.clamp(constraints.start, constraints.end)
+                    });
+                    regions.left += size as f32;
+                }
+                PanelAnchor::Right => {
+                    let size = dimention_constraints.0.map_or(size, |constraints| {
+                        size.clamp(constraints.start, constraints.end)
+                    });
+                    regions.right += size as f32;
+                }
+                PanelAnchor::Top => {
+                    let size = dimention_constraints.1.map_or(size, |constraints| {
+                        size.clamp(constraints.start, constraints.end)
+                    });
+                    regions.top += size as f32;
+                }
+                PanelAnchor::Bottom => {
+                    let size = dimention_constraints.1.map_or(size, |constraints| {
+                        size.clamp(constraints.start, constraints.end)
+                    });
+                    regions.bottom += size as f32;
                 }
             }
         }
@@ -452,6 +621,10 @@ impl App {
         &mut self,
         workspace_handle: ObjectId,
     ) -> Option<Task<cosmic::Action<Msg>>> {
+        if self.closing() {
+            return None;
+        }
+        let opening = self.anim.is_some_and(|anim| anim.to == 1.0);
         if let Some((cur_window, _)) = self.layer_surfaces.iter().find(|(_, layer_surface)| {
             self.workspaces
                 .for_output(&layer_surface.output)
@@ -491,6 +664,9 @@ impl App {
                             bottom_right: rad[2] as u32,
                         }
                     } else {
+                        if opening {
+                            return None;
+                        }
                         rects.push(*rect);
                         return None;
                     };
@@ -560,6 +736,34 @@ impl Application for App {
             },
             Msg::SourceFinished => {
                 self.drag_surface = None;
+            }
+            Msg::Tick(now) => {
+                self.switch_anims.retain(|_, anim| anim.t(now) < 1.0);
+                let Some(anim) = self.anim else {
+                    return Task::none();
+                };
+                let anchor = self.first_anim_frame.get();
+                if anim.to > anim.from && anchor.is_none() && !self.layer_surfaces.is_empty() {
+                    return Task::none();
+                }
+                let anim = anim.anchored(anchor);
+                if anim.done(now, ANIM_MAX_STAGGER) {
+                    if anim.to == 0.0 {
+                        return self.finish_hide();
+                    }
+                    self.anim = None;
+                    let to_update: Vec<_> = self
+                        .workspaces
+                        .0
+                        .iter()
+                        .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                        .collect();
+                    return Task::batch(
+                        to_update
+                            .into_iter()
+                            .filter_map(|w| self.update_active_workspace(w)),
+                    );
+                }
             }
             Msg::WaylandEvent(evt) => match evt {
                 WaylandEvent::Output(evt, output) => {
@@ -650,6 +854,42 @@ impl Application for App {
                             }
                             self.workspaces.0.push(w);
                         }
+                        if self.visible && self.anim.is_none() {
+                            for output in &self.outputs {
+                                let old_active = old_workspaces
+                                    .for_output(&output.handle)
+                                    .find(|w| w.is_active());
+                                let new_active_workspace = self
+                                    .workspaces
+                                    .for_output(&output.handle)
+                                    .find(|w| w.is_active());
+                                if let (Some(old), Some(new)) = (old_active, new_active_workspace)
+                                    && old.handle() != new.handle()
+                                {
+                                    let direction =
+                                        match new.info.coordinates.cmp(&old.info.coordinates) {
+                                            std::cmp::Ordering::Greater => 1,
+                                            std::cmp::Ordering::Less => -1,
+                                            std::cmp::Ordering::Equal => 0,
+                                        };
+                                    if direction != 0 {
+                                        log::debug!(
+                                            "sliding workspace contents on output {}: direction {}",
+                                            output.name,
+                                            direction
+                                        );
+                                        self.switch_anims.insert(
+                                            output.handle.clone(),
+                                            SwitchAnim {
+                                                start: Instant::now(),
+                                                direction,
+                                                from_workspace: old.handle().clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         self.update_capture_filter();
                         if self.visible {
                             return Task::batch(new_active.into_iter().map(|new| {
@@ -661,6 +901,10 @@ impl Application for App {
                     backend::Event::NewToplevel(handle, info) => {
                         log::debug!("New toplevel: {info:?}");
                         let app_id = info.app_id.clone();
+                        let activated_at = info
+                            .state
+                            .contains(&zcosmic_toplevel_handle_v1::State::Activated)
+                            .then(Instant::now);
                         let icon_task = iced::Task::perform(
                             desktop_info::icon_for_app_id(app_id.clone()),
                             move |path| Msg::UpdateToplevelIcon(app_id.clone(), path),
@@ -672,6 +916,7 @@ impl Application for App {
                             info,
                             img: None,
                             pending_move: None,
+                            activated_at,
                         });
                         // Close workspaces view if a window spawns while open
                         #[cfg(not(feature = "mock-backend"))]
@@ -696,6 +941,16 @@ impl Application for App {
                             // XX must clean up rectangles after the window has moved
                             t_w = Some((handle.id(), info.workspace.clone()));
 
+                            if !toplevel
+                                .info
+                                .state
+                                .contains(&zcosmic_toplevel_handle_v1::State::Activated)
+                                && info
+                                    .state
+                                    .contains(&zcosmic_toplevel_handle_v1::State::Activated)
+                            {
+                                toplevel.activated_at = Some(Instant::now());
+                            }
                             if toplevel
                                 .pending_move
                                 .as_ref()
@@ -785,6 +1040,9 @@ impl Application for App {
                 return self.hide();
             }
             Msg::ActivateWorkspace(workspace_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 if let Some(workspace) = self.workspaces.for_handle(&workspace_handle)
                     && workspace.is_active()
                 {
@@ -792,11 +1050,11 @@ impl Application for App {
                 }
 
                 self.send_wayland_cmd(backend::Cmd::ActivateWorkspace(workspace_handle.clone()));
-                if let Some(value) = self.update_active_workspace(workspace_handle.id()) {
-                    return value;
-                }
             }
             Msg::ActivateToplevel(toplevel_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 self.send_wayland_cmd(backend::Cmd::ActivateToplevel(toplevel_handle));
                 return self.hide();
             }
@@ -828,10 +1086,30 @@ impl Application for App {
                 }
             }
             Msg::CloseToplevel(toplevel_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 // TODO confirmation?
                 self.send_wayland_cmd(backend::Cmd::CloseToplevel(toplevel_handle));
             }
+            Msg::MinimizeToplevel(toplevel_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
+                self.send_wayland_cmd(backend::Cmd::MinimizeToplevel(toplevel_handle));
+                return self.hide();
+            }
+            Msg::ToggleMaximizeToplevel(toplevel_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
+                self.send_wayland_cmd(backend::Cmd::ToggleMaximizeToplevel(toplevel_handle));
+                return self.hide();
+            }
             Msg::StartDrag(drag_surface) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 // if let DragSurface::Toplevel(t) = &drag_surface {}
                 self.drag_surface = Some((drag_surface, Default::default()));
                 let to_update: Vec<_> = self
@@ -847,6 +1125,9 @@ impl Application for App {
                 );
             }
             Msg::DndEnter(drop_target, _x, _y, _mimes) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 self.drop_target = Some(drop_target);
             }
             Msg::DndLeave(drop_target) => {
@@ -872,6 +1153,9 @@ impl Application for App {
                 }
             }
             Msg::DndToplevelDrop(_toplevel) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 if let Some((DragSurface::Toplevel(handle), _)) = &self.drag_surface {
                     match self.drop_target.take() {
                         Some(
@@ -943,6 +1227,9 @@ impl Application for App {
                 }
             }
             Msg::OnScroll(output, delta) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 let discrete_delta = self.scroll.update(delta);
                 if discrete_delta.y != 0 {
                     // TODO assumes only one active workspace per output
@@ -961,6 +1248,9 @@ impl Application for App {
             }
             Msg::DndWorkspaceDrag => {}
             Msg::DndWorkspaceDrop(_workspace) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 if let Some((DragSurface::Workspace(handle), _)) = &self.drag_surface {
                     match self.drop_target.take() {
                         Some(
@@ -991,6 +1281,9 @@ impl Application for App {
                 }
             }
             Msg::TogglePinned(workspace_handle) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 if let Some(workspace) = self.workspaces.for_handle(&workspace_handle) {
                     self.send_wayland_cmd(backend::Cmd::SetWorkspacePinned(
                         workspace_handle,
@@ -1024,6 +1317,9 @@ impl Application for App {
                 self.panel_configs.insert(config.name.clone(), Some(config));
             }
             Msg::ActionOnTyping(input) => {
+                if self.closing() {
+                    return Task::none();
+                }
                 let cmd = match self.conf.workspace_config.action_on_typing {
                     cosmic_comp_config::workspace::Action::None => return Task::none(),
                     cosmic_comp_config::workspace::Action::OpenLauncher => {
@@ -1134,6 +1430,9 @@ impl Application for App {
             bg_subscription,
             rectangle_tracker_subscription(self.sub_ctr).map(|update| Msg::Rectangle(update.1)),
         ];
+        if self.anim.is_some() || !self.switch_anims.is_empty() {
+            subscriptions.push(iced::time::every(ANIM_TICK).map(Msg::Tick));
+        }
         if let Some(conn) = self.conn.clone() {
             subscriptions.push(backend::subscription(conn).map(Msg::Wayland));
         }
@@ -1154,6 +1453,14 @@ impl Application for App {
             .get(&id)
             .zip(self.rectangle_tracker.as_ref())
         {
+            // Anchor the opening animation to the first built layer surface
+            // frame; anchor set here because `view_window` runs for the very
+            // first frame of a newly mapped surface.
+            if self.anim.is_some_and(|anim| anim.to > anim.from)
+                && self.first_anim_frame.get().is_none()
+            {
+                self.first_anim_frame.set(Some(Instant::now()));
+            }
             return view::layer_surface(self, surface, id, rectangle_track);
         }
         log::error!("non-existant layer shell id {}?", id);

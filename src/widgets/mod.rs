@@ -4,6 +4,8 @@ use cosmic::iced::event::Event;
 use cosmic::iced::{Length, Rectangle, Size, Vector};
 use std::marker::PhantomData;
 
+mod anim;
+pub use anim::{fly_in, slide};
 mod image_bg;
 mod workspace_bar;
 pub use workspace_bar::workspace_bar;

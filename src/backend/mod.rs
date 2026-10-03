@@ -88,6 +88,8 @@ pub enum Cmd {
     CaptureFilter(CaptureFilter),
     ActivateToplevel(ExtForeignToplevelHandleV1),
     CloseToplevel(ExtForeignToplevelHandleV1),
+    MinimizeToplevel(ExtForeignToplevelHandleV1),
+    ToggleMaximizeToplevel(ExtForeignToplevelHandleV1),
     MoveToplevelToWorkspace(
         ExtForeignToplevelHandleV1,
         ExtWorkspaceHandleV1,

@@ -107,6 +107,30 @@ impl AppData {
                     state.manager.close(cosmic_toplevel);
                 }
             }
+            Cmd::MinimizeToplevel(toplevel_handle) => {
+                let info = self.toplevel_info_state.info(&toplevel_handle);
+                if let Some(cosmic_toplevel) = info.and_then(|x| x.cosmic_toplevel.as_ref())
+                    && let Some(state) = &self.toplevel_manager_state
+                {
+                    state.manager.set_minimized(cosmic_toplevel);
+                }
+            }
+            Cmd::ToggleMaximizeToplevel(toplevel_handle) => {
+                let info = self.toplevel_info_state.info(&toplevel_handle);
+                if let Some(info) = info
+                    && let Some(cosmic_toplevel) = info.cosmic_toplevel.as_ref()
+                    && let Some(state) = &self.toplevel_manager_state
+                {
+                    if info
+                        .state
+                        .contains(&cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State::Maximized)
+                    {
+                        state.manager.unset_maximized(cosmic_toplevel);
+                    } else {
+                        state.manager.set_maximized(cosmic_toplevel);
+                    }
+                }
+            }
             Cmd::MoveToplevelToWorkspace(toplevel_handle, workspace_handle, output) => {
                 let info = self.toplevel_info_state.info(&toplevel_handle);
                 if let Some(cosmic_toplevel) = info.and_then(|x| x.cosmic_toplevel.as_ref())

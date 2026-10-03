@@ -86,6 +86,7 @@ pub struct ToplevelInfo {
     pub state: HashSet<zcosmic_toplevel_handle_v1::State>,
     pub output: HashSet<wl_output::WlOutput>,
     pub workspace: HashSet<ExtWorkspaceHandleV1>,
+    pub decoration_mode: Option<zcosmic_toplevel_handle_v1::DecorationMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +147,7 @@ impl AppData {
                     },
                     output: HashSet::from([output.clone()]),
                     workspace: HashSet::from([workspace_handle.clone()]),
+                    decoration_mode: None,
                 };
                 self.send_event(Event::NewToplevel(toplevel_handle.clone(), toplevel_info));
                 self.send_event(Event::ToplevelCapture(
@@ -181,6 +183,12 @@ impl AppData {
             }
             Cmd::CloseToplevel(toplevel_handle) => {
                 println!("Close {:?}", toplevel_handle);
+            }
+            Cmd::MinimizeToplevel(toplevel_handle) => {
+                println!("Minimize {:?}", toplevel_handle);
+            }
+            Cmd::ToggleMaximizeToplevel(toplevel_handle) => {
+                println!("ToggleMaximize {:?}", toplevel_handle);
             }
             Cmd::MoveToplevelToWorkspace(toplevel_handle, workspace_handle, output) => {}
             Cmd::ActivateWorkspace(workspace_handle) => {
