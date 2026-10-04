@@ -2,12 +2,12 @@
 name = "cosmic-workspaces"
 version = "1.0.12"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.99"
 
 [dependencies]
-anyhow = "1.0.102"
-calloop = { version = "0.14.4", features = ["executor"] }
-clap = { version = "4", features = ["derive"] }
+anyhow = "1.0.104"
+calloop = { version = "0.14.5", features = ["executor"] }
+clap = { version = "4.6.7", features = ["derive"] }
 cosmic-bg-config = { git = "https://github.com/hahnavi/cosmic-bg", branch = "hahnavi" }
 cosmic-comp-config = { git = "https://github.com/hahnavi/cosmic-comp", branch = "hahnavi" }
 env_logger = "0.11.9"
@@ -23,21 +23,21 @@ libcosmic = { git = "https://github.com/hahnavi/libcosmic", branch = "hahnavi", 
 cosmic-config = { git = "https://github.com/hahnavi/libcosmic", branch = "hahnavi" }
 freedesktop-icons = { package = "cosmic-freedesktop-icons", git = "https://github.com/pop-os/freedesktop-icons" }
 
-memmap2 = "0.9.10"
-tokio = "1.49.0"
+memmap2 = "0.9.11"
+tokio = "1.53.2"
 wayland-protocols = "0.32.10"
 delegate = "0.13.5"
-itertools = "0.14.0"
-log = "0.4.29"
+itertools = "0.15.0"
+log = "0.4.34"
 i18n-embed-fl = "0.10"
 rust-embed = "8.11.0"
-rustix = { version = "1.1.3", features = ["fs", "shm"] }
+rustix = { version = "1.1.5", features = ["fs", "shm"] }
 calloop-wayland-source = "0.4.1"
 aliasable = "0.1.3"
 zbus = "5.13.2"
-tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 ash = { version = "0.38.0", features = ["loaded"] }
-bytemuck = "1.25.0"
+bytemuck = "1.25.2"
 cosmic-panel-config = { git = "https://github.com/hahnavi/cosmic-panel", branch = "hahnavi" }
 
 [dependencies.i18n-embed]
@@ -60,9 +60,6 @@ opt-level = 1
 # libcosmic = { path = "../libcosmic" }
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
-# libcosmic = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# cosmic-config = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# cosmic-theme = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 
 # [patch.'https://github.com/hahnavi/cosmic-protocols']
 # cosmic-client-toolkit = { path = "../cosmic-protocols/client-toolkit" }

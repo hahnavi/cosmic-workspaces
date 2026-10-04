@@ -20,8 +20,10 @@ pub struct ScreencopySession {
     formats: Option<Formats>,
     // swapchain buffers
     buffers: Option<[Buffer; BUFFER_COUNT]>,
+    // Index of the buffer being captured into; the other one is displayed.
+    capture_idx: usize,
     session: CaptureSession,
-    // Future signaled when buffer is signaled.
+    // Future signaled when the displayed buffer is released by the app.
     // if triple buffer is used, will need more than one.
     release: Option<SubsurfaceBufferRelease>,
 }
@@ -45,18 +47,19 @@ impl ScreencopySession {
         Self {
             formats: None,
             buffers: None,
+            capture_idx: 0,
             session,
             release: None,
         }
     }
 
-    fn attach_buffer_and_commit(
+    pub fn attach_buffer_and_commit(
         &mut self,
         capture: &Arc<Capture>,
         conn: &Connection,
         qh: &QueueHandle<AppData>,
     ) {
-        let Some(back) = self.buffers.as_ref().map(|x| &x[1]) else {
+        let Some(back) = self.buffers.as_ref().map(|x| &x[self.capture_idx]) else {
             return;
         };
 
@@ -145,22 +148,60 @@ impl ScreencopyHandler for AppData {
             return;
         };
 
-        if session.buffers.is_none() {
+        let Some(buffers) = session.buffers.as_ref() else {
             log::error!("No capture buffers?");
+            return;
+        };
+
+        self.clear_idle_timer(&capture.source);
+
+        let idx = session.capture_idx;
+        debug_assert!(idx < buffers.len());
+        let idx = idx.min(buffers.len() - 1);
+
+        let refreshed = !buffers[idx].buffer_damage.is_empty();
+        let content_changed = refreshed || !frame.damage.is_empty();
+
+        session.buffers.as_mut().unwrap()[idx].buffer_damage.clear();
+        session.buffers.as_mut().unwrap()[idx ^ 1]
+            .buffer_damage
+            .extend_from_slice(&frame.damage);
+
+        if !content_changed {
+            self.schedule_idle_recapture(&capture);
             return;
         }
 
-        // swap buffers
-        session.buffers.as_mut().unwrap().rotate_left(1);
+        session.capture_idx = idx ^ 1;
+        let release = session.release.take();
 
-        // Capture again on damage
+        let (backing, size) = {
+            let front = &session.buffers.as_ref().unwrap()[idx];
+            (front.backing.clone(), front.size)
+        };
+        let (buffer, display_release) = SubsurfaceBuffer::new(backing);
+        session.release = Some(display_release);
+        let image = CaptureImage {
+            wl_buffer: buffer,
+            width: size.0,
+            height: size.1,
+            transform: match frame.transform {
+                WEnum::Value(value) => value,
+                WEnum::Unknown(value) => panic!("invalid capture transform: {}", value),
+            },
+            #[cfg(feature = "no-subsurfaces")]
+            image: cosmic::widget::image::Handle::from_rgba(size.0, size.1, {
+                let front = &session.buffers.as_ref().unwrap()[idx];
+                front.mmap.to_vec()
+            }),
+        };
+
         let capture_clone = capture.clone();
         let conn = conn.clone();
-        let release = session.release.take();
         let qh = qh.clone();
         self.thread_pool.spawn_ok(async move {
             if let Some(release) = release {
-                // Wait for buffer to be released by server
+                // Wait for the previously displayed buffer to be released by the app before capturing into it again
                 release.await;
             }
             let mut session = capture_clone.session.lock().unwrap();
@@ -170,30 +211,6 @@ impl ScreencopyHandler for AppData {
             session.attach_buffer_and_commit(&capture_clone, &conn, &qh);
         });
 
-        // Clear `buffer_damage` for front buffer; accumulate for other buffers.
-        session.buffers.as_mut().unwrap()[0].buffer_damage.clear();
-        for buffer in &mut session.buffers.as_mut().unwrap()[1..] {
-            buffer.buffer_damage.extend_from_slice(&frame.damage);
-        }
-
-        let front = &session.buffers.as_ref().unwrap()[0];
-        let (buffer, release) = SubsurfaceBuffer::new(front.backing.clone());
-        session.release = Some(release);
-        let image = CaptureImage {
-            wl_buffer: buffer,
-            width: front.size.0,
-            height: front.size.1,
-            transform: match frame.transform {
-                WEnum::Value(value) => value,
-                WEnum::Unknown(value) => panic!("invalid capture transform: {}", value),
-            },
-            #[cfg(feature = "no-subsurfaces")]
-            image: cosmic::widget::image::Handle::from_rgba(
-                front.size.0,
-                front.size.1,
-                front.mmap.to_vec(),
-            ),
-        };
         match &capture.source {
             CaptureSource::Toplevel(toplevel) => {
                 let info = self
@@ -233,6 +250,8 @@ impl ScreencopyHandler for AppData {
             };
             if let Some(formats) = &session.formats {
                 session.buffers = Some(array::from_fn(|_| self.create_buffer(formats)));
+                session.capture_idx = 0;
+                session.release = None;
             }
             session.attach_buffer_and_commit(&capture, conn, &self.qh);
         } else {
@@ -242,14 +261,14 @@ impl ScreencopyHandler for AppData {
             } else {
                 log::error!("Screencopy failed: {:?}", reason);
             }
-            capture.stop();
+            self.stop_capture(&capture);
         }
     }
 
     fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session: &CaptureSession) {
         // TODO
         if let Some(capture) = Capture::for_session(session) {
-            capture.stop();
+            self.stop_capture(&capture);
         }
     }
 }

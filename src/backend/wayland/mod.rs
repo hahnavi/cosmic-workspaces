@@ -15,6 +15,7 @@ use cctk::wayland_client::globals::registry_queue_init;
 use cctk::wayland_client::protocol::wl_seat;
 use cctk::wayland_client::{Connection, Proxy, QueueHandle};
 use cctk::workspace::WorkspaceState;
+use calloop::LoopHandle;
 use cosmic::cctk;
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::futures::executor::{ThreadPool, block_on};
@@ -25,6 +26,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 mod buffer;
 use buffer::Buffer;
@@ -40,6 +42,8 @@ mod vulkan;
 mod workspace;
 
 use super::{CaptureFilter, CaptureImage, Cmd, Event};
+
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn subscription(conn: Connection) -> iced::Subscription<Event> {
     #[derive(Clone)]
@@ -60,6 +64,8 @@ pub fn subscription(conn: Connection) -> iced::Subscription<Event> {
 
 pub struct AppData {
     qh: QueueHandle<Self>,
+    conn: Connection,
+    loop_handle: LoopHandle<'static, Self>,
     dmabuf_state: DmabufState,
     registry_state: RegistryState,
     toplevel_info_state: ToplevelInfoState,
@@ -71,6 +77,7 @@ pub struct AppData {
     sender: mpsc::Sender<Event>,
     capture_filter: CaptureFilter,
     captures: RefCell<HashMap<CaptureSource, Arc<Capture>>>,
+    idle_timers: RefCell<HashMap<CaptureSource, calloop::RegistrationToken>>,
     dmabuf_feedback: Option<DmabufFeedback>,
     gbm_devices: GbmDevices,
     thread_pool: ThreadPool,
@@ -231,7 +238,7 @@ impl AppData {
             if matches {
                 capture.start(&self.screencopy_state, &self.qh);
             } else {
-                capture.stop();
+                self.stop_capture(capture);
             }
         }
     }
@@ -252,7 +259,50 @@ impl AppData {
 
     fn remove_capture_source(&self, source: CaptureSource) {
         if let Some(capture) = self.captures.borrow_mut().remove(&source) {
-            capture.stop();
+            self.stop_capture(&capture);
+        }
+    }
+
+    fn stop_capture(&self, capture: &Capture) {
+        self.clear_idle_timer(&capture.source);
+        capture.stop();
+    }
+
+    fn clear_idle_timer(&self, source: &CaptureSource) {
+        if let Some(token) = self.idle_timers.borrow_mut().remove(source) {
+            self.loop_handle.remove(token);
+        }
+    }
+
+    fn schedule_idle_recapture(&self, capture: &Arc<Capture>) {
+        let mut timers = self.idle_timers.borrow_mut();
+        if timers.contains_key(&capture.source) {
+            return;
+        }
+
+        let source = capture.source.clone();
+        let capture = capture.clone();
+        let qh = self.qh.clone();
+        let conn = self.conn.clone();
+        match self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(IDLE_POLL_INTERVAL),
+            move |_, _, app_data: &mut AppData| {
+                {
+                    let mut session = capture.session.lock().unwrap();
+                    if let Some(session) = session.as_mut() {
+                        session.attach_buffer_and_commit(&capture, &conn, &qh);
+                    }
+                }
+                app_data.idle_timers.borrow_mut().remove(&capture.source);
+                calloop::timer::TimeoutAction::Drop
+            },
+        ) {
+            Ok(token) => {
+                timers.insert(source, token);
+            }
+            Err(err) => {
+                log::error!("Failed to schedule idle capture poll: {err}");
+            }
         }
     }
 }
@@ -323,8 +373,14 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
         }
 
         let registry_state = RegistryState::new(&globals);
+
+        let mut event_loop = calloop::EventLoop::try_new().unwrap();
+        let loop_handle = event_loop.handle();
+
         let mut app_data = AppData {
             qh: qh.clone(),
+            conn: conn.clone(),
+            loop_handle: loop_handle.clone(),
             dmabuf_state,
             workspace_state: WorkspaceState::new(&registry_state, &qh), // Create before toplevel info state
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
@@ -336,6 +392,7 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             sender,
             capture_filter: CaptureFilter::default(),
             captures: RefCell::new(HashMap::new()),
+            idle_timers: RefCell::new(HashMap::new()),
             dmabuf_feedback: None,
             gbm_devices: GbmDevices::default(),
             thread_pool,
@@ -345,7 +402,6 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
         let (cmd_sender, cmd_channel) = calloop::channel::channel();
         app_data.send_event(Event::CmdSender(cmd_sender));
 
-        let mut event_loop = calloop::EventLoop::try_new().unwrap();
         WaylandSource::new(conn, event_queue)
             .insert(event_loop.handle())
             .unwrap();
